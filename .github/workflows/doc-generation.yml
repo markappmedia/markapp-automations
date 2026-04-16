@@ -1,0 +1,223 @@
+name: Doc & Contract Generation
+
+on:
+  # Trigger via webhook (from form submission, CRM, or Zapier)
+  repository_dispatch:
+    types:
+      - generate_proposal
+      - generate_contract
+      - generate_media_plan
+      - generate_invoice
+      - generate_deck_brief
+
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      doc_type:
+        description: 'Document type to generate'
+        required: true
+        default: 'proposal'
+        type: choice
+        options:
+          - proposal
+          - contract
+          - media_plan
+          - invoice
+          - deck_brief
+      client_name:
+        description: 'Client name'
+        required: true
+      client_email:
+        description: 'Client email (for delivery)'
+        required: true
+      campaign_budget:
+        description: 'Campaign budget (USD)'
+        required: false
+      deal_id:
+        description: 'CRM deal ID (optional)'
+        required: false
+
+env:
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+  GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+  GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+  DOCUSIGN_API_KEY: ${{ secrets.DOCUSIGN_API_KEY }}
+  MARKDASH_API_KEY: ${{ secrets.MARKDASH_API_KEY }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Determine doc type & extract payload
+  # ─────────────────────────────────────────────
+  prepare:
+    name: Prepare Document Parameters
+    runs-on: ubuntu-latest
+    outputs:
+      doc_type: ${{ steps.params.outputs.doc_type }}
+      client_name: ${{ steps.params.outputs.client_name }}
+      client_email: ${{ steps.params.outputs.client_email }}
+      deal_id: ${{ steps.params.outputs.deal_id }}
+    steps:
+      - name: Extract parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "doc_type=${{ github.event.client_payload.doc_type }}" >> $GITHUB_OUTPUT
+            echo "client_name=${{ github.event.client_payload.client_name }}" >> $GITHUB_OUTPUT
+            echo "client_email=${{ github.event.client_payload.client_email }}" >> $GITHUB_OUTPUT
+            echo "deal_id=${{ github.event.client_payload.deal_id }}" >> $GITHUB_OUTPUT
+          else
+            echo "doc_type=${{ github.event.inputs.doc_type }}" >> $GITHUB_OUTPUT
+            echo "client_name=${{ github.event.inputs.client_name }}" >> $GITHUB_OUTPUT
+            echo "client_email=${{ github.event.inputs.client_email }}" >> $GITHUB_OUTPUT
+            echo "deal_id=${{ github.event.inputs.deal_id }}" >> $GITHUB_OUTPUT
+          fi
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Generate document (PDF / DOCX)
+  # ─────────────────────────────────────────────
+  generate:
+    name: Generate Document
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      file_path: ${{ steps.generate.outputs.file_path }}
+      file_name: ${{ steps.generate.outputs.file_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install jinja2 weasyprint python-docx reportlab requests python-dotenv
+
+      - name: Install system dependencies (for PDF rendering)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+
+      - name: Generate document
+        id: generate
+        env:
+          DOC_TYPE: ${{ needs.prepare.outputs.doc_type }}
+          CLIENT_NAME: ${{ needs.prepare.outputs.client_name }}
+          CLIENT_EMAIL: ${{ needs.prepare.outputs.client_email }}
+          DEAL_ID: ${{ needs.prepare.outputs.deal_id }}
+          MARKDASH_API_KEY: ${{ secrets.MARKDASH_API_KEY }}
+        run: python scripts/generate_doc.py
+
+      - name: Upload document artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-doc-${{ github.run_id }}
+          path: output/
+          retention-days: 14
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Upload to Google Drive
+  # ─────────────────────────────────────────────
+  upload-drive:
+    name: Upload to Google Drive
+    runs-on: ubuntu-latest
+    needs: [prepare, generate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-doc-${{ github.run_id }}
+          path: output/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Upload to Google Drive
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          FILE_NAME: ${{ needs.generate.outputs.file_name }}
+        run: |
+          pip install google-api-python-client google-auth python-dotenv
+          python scripts/upload_to_drive.py
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Send document via email
+  # ─────────────────────────────────────────────
+  deliver:
+    name: Deliver Document to Client
+    runs-on: ubuntu-latest
+    needs: [prepare, generate, upload-drive]
+    if: needs.prepare.outputs.doc_type == 'proposal' || needs.prepare.outputs.doc_type == 'contract' || needs.prepare.outputs.doc_type == 'media_plan'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-doc-${{ github.run_id }}
+          path: output/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Send document via SendGrid
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          TO_EMAIL: ${{ needs.prepare.outputs.client_email }}
+          CLIENT_NAME: ${{ needs.prepare.outputs.client_name }}
+          DOC_TYPE: ${{ needs.prepare.outputs.doc_type }}
+          FILE_NAME: ${{ needs.generate.outputs.file_name }}
+        run: |
+          pip install sendgrid python-dotenv
+          python scripts/send_document.py
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Notify team on Slack
+  # ─────────────────────────────────────────────
+  notify:
+    name: Notify Team on Slack
+    runs-on: ubuntu-latest
+    needs: [prepare, generate, deliver]
+    if: always()
+    steps:
+      - name: Notify success
+        if: needs.generate.result == 'success'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":page_facing_up: *Doc Generated & Sent*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Type:* ${{ needs.prepare.outputs.doc_type }}" },
+                    { "type": "mrkdwn", "text": "*Client:* ${{ needs.prepare.outputs.client_name }}" },
+                    { "type": "mrkdwn", "text": "*Email:* ${{ needs.prepare.outputs.client_email }}" },
+                    { "type": "mrkdwn", "text": "*Deal ID:* ${{ needs.prepare.outputs.deal_id || 'N/A' }}" }
+                  ]
+                }
+              ]
+            }
+
+      - name: Notify failure
+        if: needs.generate.result == 'failure'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":rotating_light: *Doc Generation Failed* for ${{ needs.prepare.outputs.client_name }} (${{ needs.prepare.outputs.doc_type }}) — https://github.com/markappmedia/markapp-automations/actions/runs/${{ github.run_id }}"
+            }

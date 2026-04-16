@@ -1,0 +1,163 @@
+name: Daily Reporting Pipeline
+
+on:
+  schedule:
+    # Run every weekday at 7:00 AM UTC — data ready before team starts
+    - cron: '0 7 * * 1-5'
+    # Weekly full report every Monday at 6:00 AM UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      report_type:
+        description: 'Report to generate'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - weekly
+          - monthly
+          - custom_range
+      date_from:
+        description: 'Start date (YYYY-MM-DD) — for custom_range only'
+        required: false
+      date_to:
+        description: 'End date (YYYY-MM-DD) — for custom_range only'
+        required: false
+
+env:
+  MARKDASH_API_KEY: ${{ secrets.MARKDASH_API_KEY }}
+  MARKDASH_API_URL: ${{ secrets.MARKDASH_API_URL }}
+  GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+  GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Pull data from MarkDash & process
+  # ─────────────────────────────────────────────
+  fetch-and-process:
+    name: Fetch & Process MarkDash Data
+    runs-on: ubuntu-latest
+    outputs:
+      report_path: ${{ steps.generate.outputs.report_path }}
+      summary_json: ${{ steps.generate.outputs.summary_json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas openpyxl gspread google-auth python-dotenv jinja2
+
+      - name: Determine report type
+        id: report_type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "type=${{ github.event.inputs.report_type }}" >> $GITHUB_OUTPUT
+            echo "date_from=${{ github.event.inputs.date_from }}" >> $GITHUB_OUTPUT
+            echo "date_to=${{ github.event.inputs.date_to }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 6 * * 1" ]; then
+            echo "type=weekly" >> $GITHUB_OUTPUT
+          else
+            echo "type=daily" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch data & generate report
+        id: generate
+        env:
+          REPORT_TYPE: ${{ steps.report_type.outputs.type }}
+          DATE_FROM: ${{ steps.report_type.outputs.date_from }}
+          DATE_TO: ${{ steps.report_type.outputs.date_to }}
+        run: python scripts/generate_report.py
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: markapp-report-${{ steps.report_type.outputs.type }}-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Push to Google Sheets
+  # ─────────────────────────────────────────────
+  push-to-sheets:
+    name: Push to Google Sheets
+    runs-on: ubuntu-latest
+    needs: fetch-and-process
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download report artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: markapp-report-${{ github.event.inputs.report_type || 'daily' }}-${{ github.run_id }}
+          path: reports/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install gspread google-auth pandas python-dotenv
+
+      - name: Push data to Google Sheets
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
+        run: python scripts/push_to_sheets.py
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Send report summary to Slack
+  # ─────────────────────────────────────────────
+  notify-slack:
+    name: Notify Slack with Report Summary
+    runs-on: ubuntu-latest
+    needs: [fetch-and-process, push-to-sheets]
+    if: always()
+    steps:
+      - name: Send success summary
+        if: needs.fetch-and-process.result == 'success'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":bar_chart: *MarkApp Daily Report Ready*",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":bar_chart: *MarkApp Daily Report — ${{ github.run_id }}*\n${{ needs.fetch-and-process.outputs.summary_json }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View in MarkDash" },
+                      "url": "${{ secrets.MARKDASH_DASHBOARD_URL }}"
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Send failure alert
+        if: needs.fetch-and-process.result == 'failure'
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":rotating_light: *MarkApp Reporting Pipeline Failed* — check GitHub Actions: https://github.com/markappmedia/markapp-automations/actions"
+            }

@@ -1,0 +1,105 @@
+name: Slack Notifications
+
+on:
+  schedule:
+    - cron: '0 8 * * 1-5'
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      alert_type:
+        description: 'Alert type'
+        required: true
+        default: 'daily_summary'
+        type: choice
+        options:
+          - daily_summary
+          - performance_alert
+          - anomaly_alert
+          - custom
+
+env:
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  SLACK_CHANNEL_ALERTS: ${{ secrets.SLACK_CHANNEL_ALERTS }}
+  SLACK_CHANNEL_REPORTS: ${{ secrets.SLACK_CHANNEL_REPORTS }}
+
+jobs:
+  daily-summary:
+    name: Daily Performance Summary
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 8 * * 1-5' || (github.event_name == 'workflow_dispatch' && github.event.inputs.alert_type == 'daily_summary')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests python-dotenv
+
+      - name: Send daily summary to Slack
+        env:
+          MARKDASH_API_KEY: ${{ secrets.MARKDASH_API_KEY }}
+          MARKDASH_API_URL: ${{ secrets.MARKDASH_API_URL }}
+        run: python scripts/daily_summary.py
+
+  anomaly-check:
+    name: Performance Anomaly Detection
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 */2 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.alert_type == 'anomaly_alert')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests numpy python-dotenv
+
+      - name: Run anomaly detection
+        env:
+          MARKDASH_API_KEY: ${{ secrets.MARKDASH_API_KEY }}
+          MARKDASH_API_URL: ${{ secrets.MARKDASH_API_URL }}
+          THRESHOLD_CTR_DROP: '0.20'
+          THRESHOLD_FILL_DROP: '0.15'
+          THRESHOLD_SPEND_SPIKE: '0.30'
+        run: python scripts/anomaly_check.py
+
+  performance-alert:
+    name: Performance Alert
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.alert_type == 'performance_alert'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests python-dotenv
+
+      - name: Send performance alert
+        env:
+          MARKDASH_API_KEY: ${{ secrets.MARKDASH_API_KEY }}
+          MARKDASH_API_URL: ${{ secrets.MARKDASH_API_URL }}
+          CAMPAIGN_ID: ${{ secrets.CAMPAIGN_ID }}
+        run: python scripts/performance_alert.py
+
+  custom-alert:
+    name: Custom Slack Alert
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.alert_type == 'custom'
+    steps:
+      - uses: slackapi/slack-github-action@v1.27.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":loudspeaker: *MarkApp Manual Alert* triggered by ${{ github.actor }}"
+            }
